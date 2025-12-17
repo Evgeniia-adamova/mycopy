@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
-__VERSION__ = "0.4.0"
+__VERSION__ = "0.5.0"
 
 
 def _safe_float(x: Any) -> float:
@@ -166,6 +166,17 @@ def build_models(
                 TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=5),
                 text_col,
             ),
+            (
+                "char",
+                # Char n-grams are often very strong for Russian (morphology, typos, short posts).
+                TfidfVectorizer(
+                    analyzer="char_wb",
+                    ngram_range=(3, 5),
+                    max_df=0.98,
+                    min_df=5,
+                ),
+                text_col,
+            ),
             ("num", Pipeline([("scaler", StandardScaler())]), num_cols),
             *(
                 [
@@ -186,6 +197,14 @@ def build_models(
         steps=[
             ("features", preproc_ridge),
             ("model", Ridge(alpha=2.0, random_state=random_state)),
+        ]
+    )
+
+    ridge_strong = Pipeline(
+        steps=[
+            ("features", preproc_ridge),
+            # Slightly more regularization tends to work better with char ngrams
+            ("model", Ridge(alpha=5.0, random_state=random_state)),
         ]
     )
 
@@ -292,6 +311,7 @@ def build_models(
 
     return {
         "ridge_log1p": ridge,
+        "ridge_char_word_log1p": ridge_strong,
         "sgd_huber_log1p": sgd_huber,
         "hgbr_svd_log1p": hgbr,
         "hgbr_svd_log1p_l1": hgbr_l1,
