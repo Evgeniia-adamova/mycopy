@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
-__VERSION__ = "0.2.0"
+__VERSION__ = "0.3.0"
 
 
 def _safe_float(x: Any) -> float:
@@ -127,7 +127,7 @@ def build_models(
     from sklearn.compose import ColumnTransformer
     from sklearn.decomposition import TruncatedSVD
     from sklearn.ensemble import HistGradientBoostingRegressor
-    from sklearn.linear_model import HuberRegressor, Ridge
+    from sklearn.linear_model import Ridge, SGDRegressor
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -189,11 +189,22 @@ def build_models(
         ]
     )
 
-    # Robust linear: Huber loss reduces outlier sensitivity (works well with log-target).
-    huber = Pipeline(
+    # Robust linear model that works with sparse TF-IDF (unlike HuberRegressor + LBFGS).
+    sgd_huber = Pipeline(
         steps=[
             ("features", preproc_ridge),
-            ("model", HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=10_000)),
+            (
+                "model",
+                SGDRegressor(
+                    loss="huber",
+                    epsilon=1.35,
+                    alpha=1e-5,
+                    penalty="l2",
+                    max_iter=4000,
+                    tol=1e-4,
+                    random_state=random_state,
+                ),
+            ),
         ]
     )
 
@@ -263,7 +274,7 @@ def build_models(
 
     return {
         "ridge_log1p": ridge,
-        "huber_log1p": huber,
+        "sgd_huber_log1p": sgd_huber,
         "hgbr_svd_log1p": hgbr,
         "hgbr_svd_log1p_l1": hgbr_l1,
     }
@@ -296,6 +307,7 @@ def train_and_evaluate(
     use_engagement: bool = True,
 ) -> Tuple[pd.DataFrame, Iterable[TrainResult]]:
     from sklearn.model_selection import train_test_split
+    from sklearn.isotonic import IsotonicRegression
 
     # Target
     y = df["col_views_count"].astype(float).values
@@ -343,9 +355,22 @@ def train_and_evaluate(
         except TypeError:
             # Estimator doesn't support sample_weight; retry without it.
             model.fit(X_train, y_train_log)
+        # Raw prediction in log-space
         y_pred_log = model.predict(X_test)
         y_pred = np.expm1(y_pred_log)
         y_pred = np.maximum(0.0, y_pred)
+
+        # Optional post-hoc calibration in log-space to reduce systematic bias/extremes
+        # Fit isotonic on train predictions -> true log target.
+        try:
+            y_train_pred_log = model.predict(X_train)
+            iso = IsotonicRegression(out_of_bounds="clip")
+            iso.fit(y_train_pred_log, y_train_log, sample_weight=sample_weight)
+            y_pred_log_iso = iso.transform(y_pred_log)
+            y_pred_iso = np.expm1(y_pred_log_iso)
+            y_pred_iso = np.maximum(0.0, y_pred_iso)
+        except Exception:
+            y_pred_iso = None
 
         preds[name] = y_pred
         results.append(
@@ -360,6 +385,21 @@ def train_and_evaluate(
                 },
             )
         )
+
+        if y_pred_iso is not None:
+            preds[f"{name}_iso"] = y_pred_iso
+            results.append(
+                TrainResult(
+                    model_name=f"{name}_iso",
+                    metrics={
+                        "MAE": float(np.mean(np.abs(y_test - y_pred_iso))),
+                        "RMSE": float(np.sqrt(np.mean((y_test - y_pred_iso) ** 2))),
+                        "RMSLE": _rmsle(y_test, y_pred_iso),
+                        "MAPE_%": _mape(y_test, y_pred_iso),
+                        "sMAPE_%": _smape(y_test, y_pred_iso),
+                    },
+                )
+            )
 
     # Simple mean ensemble (often improves stability)
     if len(preds) >= 2:
@@ -481,7 +521,11 @@ def main() -> int:
         )
 
     # Show a few worst errors for quick debugging
-    pred_col = "pred_mean_ensemble" if "pred_mean_ensemble" in test_scored.columns else test_scored.filter(like="pred_").columns[0]
+    # Use the best-by-RMSLE model for error inspection/group metrics (ensemble isn't always best).
+    best_model = sorted(results, key=lambda x: x.metrics["RMSLE"])[0].model_name
+    pred_col = f"pred_{best_model}" if f"pred_{best_model}" in test_scored.columns else (
+        "pred_mean_ensemble" if "pred_mean_ensemble" in test_scored.columns else test_scored.filter(like="pred_").columns[0]
+    )
     err_pct = np.abs(test_scored[pred_col] - test_scored["col_views_count"]) / np.maximum(1.0, test_scored["col_views_count"]) * 100
     worst = test_scored.assign(error_pct=err_pct).sort_values("error_pct", ascending=False).head(10)
     print("\nWorst 10 by % error (using", pred_col, "):")
