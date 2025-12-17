@@ -27,6 +27,8 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
+__VERSION__ = "0.2.0"
+
 
 def _safe_float(x: Any) -> float:
     try:
@@ -52,6 +54,16 @@ def _rmsle(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = np.maximum(0.0, y_true)
     y_pred = np.maximum(0.0, y_pred)
     return float(np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)))
+
+
+def _view_group(views: float) -> str:
+    if views <= 200:
+        return "low"
+    if views <= 500:
+        return "medium"
+    if views <= 1000:
+        return "high"
+    return "very_high"
 
 
 def basic_text_clean(s: str) -> str:
@@ -181,7 +193,7 @@ def build_models(
     huber = Pipeline(
         steps=[
             ("features", preproc_ridge),
-            ("model", HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=2000)),
+            ("model", HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=10_000)),
         ]
     )
 
@@ -221,10 +233,28 @@ def build_models(
             (
                 "model",
                 HistGradientBoostingRegressor(
-                    loss="absolute_error",  # L1 is often better for skewed targets
+                    # Squared error on log1p target directly optimizes RMSLE-like objective.
+                    loss="squared_error",
                     learning_rate=0.08,
                     max_depth=6,
                     max_iter=400,
+                    random_state=random_state,
+                ),
+            ),
+        ]
+    )
+
+    # Alternative: L1 on log-target (sometimes improves MAE/MAPE)
+    hgbr_l1 = Pipeline(
+        steps=[
+            ("features", preproc_hgbr),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    loss="absolute_error",
+                    learning_rate=0.08,
+                    max_depth=6,
+                    max_iter=500,
                     random_state=random_state,
                 ),
             ),
@@ -235,6 +265,7 @@ def build_models(
         "ridge_log1p": ridge,
         "huber_log1p": huber,
         "hgbr_svd_log1p": hgbr,
+        "hgbr_svd_log1p_l1": hgbr_l1,
     }
 
 
@@ -247,6 +278,8 @@ def make_sample_weights(y: np.ndarray, scheme: str) -> np.ndarray | None:
         w = 1.0 / np.sqrt(np.maximum(0.0, y) + 1.0)
     elif scheme in {"inv", "inverse"}:
         w = 1.0 / np.maximum(1.0, np.maximum(0.0, y))
+    elif scheme in {"inv_log", "inverse_log"}:
+        w = 1.0 / np.log1p(np.maximum(0.0, y) + 1.0)
     else:
         raise ValueError(f"Unknown weighting scheme: {scheme}")
     # Normalize to mean=1 for numerical stability
@@ -353,6 +386,23 @@ def train_and_evaluate(
     return out_test, results
 
 
+def group_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Dict[str, float]]:
+    dfm = pd.DataFrame({"y": y_true, "p": y_pred})
+    dfm["group"] = dfm["y"].map(_view_group)
+    out: Dict[str, Dict[str, float]] = {}
+    for g, sub in dfm.groupby("group"):
+        yt = sub["y"].to_numpy(float)
+        yp = sub["p"].to_numpy(float)
+        out[g] = {
+            "n": float(len(sub)),
+            "RMSLE": _rmsle(yt, yp),
+            "MAPE_%": _mape(yt, yp),
+            "sMAPE_%": _smape(yt, yp),
+            "MAE": float(np.mean(np.abs(yt - yp))),
+        }
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path to CSV with posts")
@@ -362,8 +412,8 @@ def main() -> int:
     ap.add_argument("--test-size", type=float, default=0.30)
     ap.add_argument(
         "--sample-weighting",
-        default="inv_sqrt",
-        help="Sample weighting for training: none | inv_sqrt | inv (default: inv_sqrt)",
+        default="inv",
+        help="Sample weighting: none | inv_sqrt | inv | inv_log (default: inv)",
     )
     ap.add_argument(
         "--use-author-ids",
@@ -376,6 +426,8 @@ def main() -> int:
         help="If CSV contains likes/comments/reposts counts, use them as numeric features",
     )
     args = ap.parse_args()
+
+    print(f"vk-views-regression script version: {__VERSION__}")
 
     df = pd.read_csv(args.csv, sep=args.sep, encoding=args.encoding)
     needed = {"col_text", "col_views_count", "col_date"}
@@ -435,6 +487,22 @@ def main() -> int:
     print("\nWorst 10 by % error (using", pred_col, "):")
     with pd.option_context("display.max_colwidth", 120):
         print(worst[["col_date", "col_views_count", pred_col, "error_pct", "col_text"]].to_string(index=False))
+
+    gm = group_metrics(
+        test_scored["col_views_count"].to_numpy(float),
+        test_scored[pred_col].to_numpy(float),
+    )
+    print("\nGroup metrics (using", pred_col, "):")
+    for g in ["low", "medium", "high", "very_high"]:
+        if g in gm:
+            m = gm[g]
+            print(
+                f"- {g:9s} n={int(m['n']):4d} | "
+                f"RMSLE={m['RMSLE']:.4f}  "
+                f"MAE={m['MAE']:.1f}  "
+                f"MAPE={m['MAPE_%']:.1f}%  "
+                f"sMAPE={m['sMAPE_%']:.1f}%"
+            )
 
     return 0
 
