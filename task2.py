@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
-__VERSION__ = "0.3.0"
+__VERSION__ = "0.4.0"
 
 
 def _safe_float(x: Any) -> float:
@@ -272,11 +272,30 @@ def build_models(
         ]
     )
 
+    # Median regression on log-target: often reduces overprediction for low-view posts.
+    hgbr_q50 = Pipeline(
+        steps=[
+            ("features", preproc_hgbr),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    loss="quantile",
+                    quantile=0.50,
+                    learning_rate=0.08,
+                    max_depth=6,
+                    max_iter=600,
+                    random_state=random_state,
+                ),
+            ),
+        ]
+    )
+
     return {
         "ridge_log1p": ridge,
         "sgd_huber_log1p": sgd_huber,
         "hgbr_svd_log1p": hgbr,
         "hgbr_svd_log1p_l1": hgbr_l1,
+        "hgbr_svd_log1p_q50": hgbr_q50,
     }
 
 
