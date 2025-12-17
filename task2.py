@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
-__VERSION__ = "0.5.0"
+__VERSION__ = "0.6.0"
 
 
 def _safe_float(x: Any) -> float:
@@ -152,6 +152,8 @@ def build_models(
             if c in available:
                 num_cols.append(c)
 
+    # One-hot for IDs is optional; in practice target encoding is usually better and
+    # is done outside of this model builder (to avoid leakage).
     cat_cols: list[str] = []
     if use_author_ids:
         for c in ["col_owner_id", "col_from_id"]:
@@ -344,9 +346,11 @@ def train_and_evaluate(
     sample_weighting: str = "inv_sqrt",
     use_author_ids: bool = True,
     use_engagement: bool = True,
+    author_encoding: str = "target",
 ) -> Tuple[pd.DataFrame, Iterable[TrainResult]]:
     from sklearn.model_selection import train_test_split
     from sklearn.isotonic import IsotonicRegression
+    from sklearn.model_selection import KFold
 
     # Target
     y = df["col_views_count"].astype(float).values
@@ -366,8 +370,8 @@ def train_and_evaluate(
         stratify=strat,
     )
 
-    X_train = train_df
-    X_test = test_df
+    X_train = train_df.copy()
+    X_test = test_df.copy()
     y_train_log = np.log1p(train_df["col_views_count"].astype(float).values)
     y_test = test_df["col_views_count"].astype(float).values
 
@@ -376,10 +380,66 @@ def train_and_evaluate(
         scheme=sample_weighting,
     )
 
+    # Leak-free author ID encoding (biggest single lift if IDs exist).
+    author_cols = [c for c in ["col_owner_id", "col_from_id"] if c in df.columns]
+    author_encoding = author_encoding.lower().strip()
+
+    def _target_encode_oof(
+        Xtr: pd.DataFrame,
+        ytr: np.ndarray,
+        Xte: pd.DataFrame,
+        col: str,
+        *,
+        n_splits: int = 5,
+        smoothing: float = 20.0,
+    ) -> Tuple[pd.Series, pd.Series]:
+        """Out-of-fold smoothed target encoding for a single categorical column."""
+        ytr = np.asarray(ytr, dtype=float)
+        global_mean = float(np.mean(ytr))
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        oof = pd.Series(index=Xtr.index, dtype=float)
+
+        for tr_idx, val_idx in kf.split(Xtr):
+            tr_part = Xtr.iloc[tr_idx]
+            y_part = ytr[tr_idx]
+            stats = (
+                pd.DataFrame({col: tr_part[col].astype(str), "y": y_part})
+                .groupby(col)["y"]
+                .agg(["mean", "count"])
+            )
+            smooth = (stats["mean"] * stats["count"] + global_mean * smoothing) / (stats["count"] + smoothing)
+            val_keys = Xtr.iloc[val_idx][col].astype(str)
+            oof.iloc[val_idx] = val_keys.map(smooth).fillna(global_mean).to_numpy()
+
+        # Fit mapping on full training for test transform
+        stats_full = (
+            pd.DataFrame({col: Xtr[col].astype(str), "y": ytr})
+            .groupby(col)["y"]
+            .agg(["mean", "count"])
+        )
+        smooth_full = (stats_full["mean"] * stats_full["count"] + global_mean * smoothing) / (stats_full["count"] + smoothing)
+        te_test = Xte[col].astype(str).map(smooth_full).fillna(global_mean)
+        return oof, te_test
+
+    if use_author_ids and author_cols and author_encoding == "target":
+        for c in author_cols:
+            tr_enc, te_enc = _target_encode_oof(X_train, y_train_log, X_test, c)
+            X_train[f"{c}_te_log"] = tr_enc
+            X_test[f"{c}_te_log"] = te_enc
+            # frequency feature also helps
+            counts = X_train[c].astype(str).value_counts()
+            X_train[f"{c}_freq"] = X_train[c].astype(str).map(counts).fillna(0).astype(float)
+            X_test[f"{c}_freq"] = X_test[c].astype(str).map(counts).fillna(0).astype(float)
+
+        # After target-encoding, we do NOT need one-hot IDs.
+        use_author_ids_for_model = False
+    else:
+        use_author_ids_for_model = use_author_ids and author_encoding == "onehot"
+
     models = build_models(
-        available_columns=df.columns,
+        available_columns=X_train.columns,
         random_state=random_state,
-        use_author_ids=use_author_ids,
+        use_author_ids=use_author_ids_for_model,
         use_engagement=use_engagement,
     )
     results: list[TrainResult] = []
@@ -500,6 +560,11 @@ def main() -> int:
         help="If CSV contains col_owner_id/col_from_id, use them as categorical features",
     )
     ap.add_argument(
+        "--author-encoding",
+        default="target",
+        help="Author ID encoding: target | onehot | none (default: target)",
+    )
+    ap.add_argument(
         "--use-engagement",
         action="store_true",
         help="If CSV contains likes/comments/reposts counts, use them as numeric features",
@@ -542,6 +607,7 @@ def main() -> int:
         sample_weighting=args.sample_weighting,
         use_author_ids=args.use_author_ids,
         use_engagement=args.use_engagement,
+        author_encoding=args.author_encoding,
     )
 
     # Print results
