@@ -20,10 +20,9 @@ Example:
 from __future__ import annotations
 
 import argparse
-import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -90,26 +89,12 @@ def add_basic_text_features(df: pd.DataFrame, text_col: str = "col_text") -> pd.
     return out
 
 
-def add_engagement_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds likes/comments/reposts ratios IF those columns exist.
-    This is optional, but helps a lot when you have historical engagement.
-    """
+def add_engagement_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Casts engagement count columns to numeric if present (no target leakage)."""
     out = df.copy()
-    if "col_views_count" not in out.columns:
-        return out
-    views = out["col_views_count"].map(_safe_float).astype(float)
-    denom = np.maximum(1.0, views)
-
-    for raw_col, new_col in [
-        ("col_likes_count", "likes_per_view"),
-        ("col_comments_count", "comments_per_view"),
-        ("col_reposts_count", "reposts_per_view"),
-    ]:
-        if raw_col in out.columns:
-            num = out[raw_col].map(_safe_float).astype(float)
-            out[new_col] = num / denom
-
+    for col in ["col_likes_count", "col_comments_count", "col_reposts_count"]:
+        if col in out.columns:
+            out[col] = out[col].map(_safe_float).astype(float)
     return out
 
 
@@ -119,7 +104,13 @@ class TrainResult:
     metrics: Dict[str, float]
 
 
-def build_models(random_state: int = 2025):
+def build_models(
+    available_columns: Iterable[str],
+    *,
+    random_state: int = 2025,
+    use_author_ids: bool = True,
+    use_engagement: bool = True,
+):
     # Local import so the file can be imported even if sklearn isn't installed.
     from sklearn.compose import ColumnTransformer
     from sklearn.decomposition import TruncatedSVD
@@ -129,6 +120,7 @@ def build_models(random_state: int = 2025):
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
     from sklearn.feature_extraction.text import TfidfVectorizer
 
+    available = set(available_columns)
     text_col = "proc"
     num_cols = [
         "hour",
@@ -141,14 +133,18 @@ def build_models(random_state: int = 2025):
         "line_count",
         "has_link",
         "has_hashtag",
-        # optional engagement ratios (may be missing)
-        "likes_per_view",
-        "comments_per_view",
-        "reposts_per_view",
     ]
 
-    # ColumnTransformer will ignore missing columns ONLY if we pre-create them.
-    # We'll ensure they exist in the dataframe before training.
+    if use_engagement:
+        for c in ["col_likes_count", "col_comments_count", "col_reposts_count"]:
+            if c in available:
+                num_cols.append(c)
+
+    cat_cols: list[str] = []
+    if use_author_ids:
+        for c in ["col_owner_id", "col_from_id"]:
+            if c in available:
+                cat_cols.append(c)
 
     # Baseline: sparse TF-IDF + numeric scaled -> Ridge (strong baseline for text regression)
     preproc_ridge = ColumnTransformer(
@@ -159,6 +155,17 @@ def build_models(random_state: int = 2025):
                 text_col,
             ),
             ("num", Pipeline([("scaler", StandardScaler())]), num_cols),
+            *(
+                [
+                    (
+                        "cat",
+                        OneHotEncoder(handle_unknown="ignore"),
+                        cat_cols,
+                    )
+                ]
+                if cat_cols
+                else []
+            ),
         ],
         remainder="drop",
         sparse_threshold=0.3,
@@ -174,7 +181,7 @@ def build_models(random_state: int = 2025):
     huber = Pipeline(
         steps=[
             ("features", preproc_ridge),
-            ("model", HuberRegressor(epsilon=1.35, alpha=1e-4)),
+            ("model", HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=2000)),
         ]
     )
 
@@ -193,6 +200,17 @@ def build_models(random_state: int = 2025):
                 text_col,
             ),
             ("num", Pipeline([("scaler", StandardScaler())]), num_cols),
+            *(
+                [
+                    (
+                        "cat",
+                        OneHotEncoder(handle_unknown="ignore"),
+                        cat_cols,
+                    )
+                ]
+                if cat_cols
+                else []
+            ),
         ],
         remainder="drop",
         sparse_threshold=0.0,  # force dense output
@@ -220,19 +238,29 @@ def build_models(random_state: int = 2025):
     }
 
 
-def ensure_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Guarantee optional engineered columns exist (ColumnTransformer needs fixed names)."""
-    out = df.copy()
-    for col in ["likes_per_view", "comments_per_view", "reposts_per_view"]:
-        if col not in out.columns:
-            out[col] = 0.0
-    return out
+def make_sample_weights(y: np.ndarray, scheme: str) -> np.ndarray | None:
+    scheme = scheme.lower().strip()
+    if scheme in {"none", "off", "false", "0"}:
+        return None
+    y = np.asarray(y, dtype=float)
+    if scheme in {"inv_sqrt", "inverse_sqrt"}:
+        w = 1.0 / np.sqrt(np.maximum(0.0, y) + 1.0)
+    elif scheme in {"inv", "inverse"}:
+        w = 1.0 / np.maximum(1.0, np.maximum(0.0, y))
+    else:
+        raise ValueError(f"Unknown weighting scheme: {scheme}")
+    # Normalize to mean=1 for numerical stability
+    w = w * (len(w) / np.sum(w))
+    return w
 
 
 def train_and_evaluate(
     df: pd.DataFrame,
     random_state: int = 2025,
     test_size: float = 0.30,
+    sample_weighting: str = "inv_sqrt",
+    use_author_ids: bool = True,
+    use_engagement: bool = True,
 ) -> Tuple[pd.DataFrame, Iterable[TrainResult]]:
     from sklearn.model_selection import train_test_split
 
@@ -259,12 +287,29 @@ def train_and_evaluate(
     y_train_log = np.log1p(train_df["col_views_count"].astype(float).values)
     y_test = test_df["col_views_count"].astype(float).values
 
-    models = build_models(random_state=random_state)
+    sample_weight = make_sample_weights(
+        train_df["col_views_count"].astype(float).values,
+        scheme=sample_weighting,
+    )
+
+    models = build_models(
+        available_columns=df.columns,
+        random_state=random_state,
+        use_author_ids=use_author_ids,
+        use_engagement=use_engagement,
+    )
     results: list[TrainResult] = []
     preds: Dict[str, np.ndarray] = {}
 
     for name, model in models.items():
-        model.fit(X_train, y_train_log)
+        fit_kwargs: Dict[str, Any] = {}
+        if sample_weight is not None:
+            fit_kwargs["model__sample_weight"] = sample_weight
+        try:
+            model.fit(X_train, y_train_log, **fit_kwargs)
+        except TypeError:
+            # Estimator doesn't support sample_weight; retry without it.
+            model.fit(X_train, y_train_log)
         y_pred_log = model.predict(X_test)
         y_pred = np.expm1(y_pred_log)
         y_pred = np.maximum(0.0, y_pred)
@@ -315,6 +360,21 @@ def main() -> int:
     ap.add_argument("--encoding", default="utf-8", help="CSV encoding")
     ap.add_argument("--random-state", type=int, default=2025)
     ap.add_argument("--test-size", type=float, default=0.30)
+    ap.add_argument(
+        "--sample-weighting",
+        default="inv_sqrt",
+        help="Sample weighting for training: none | inv_sqrt | inv (default: inv_sqrt)",
+    )
+    ap.add_argument(
+        "--use-author-ids",
+        action="store_true",
+        help="If CSV contains col_owner_id/col_from_id, use them as categorical features",
+    )
+    ap.add_argument(
+        "--use-engagement",
+        action="store_true",
+        help="If CSV contains likes/comments/reposts counts, use them as numeric features",
+    )
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv, sep=args.sep, encoding=args.encoding)
@@ -334,8 +394,12 @@ def main() -> int:
     # Feature engineering
     df = add_time_features(df, date_col="col_date")
     df = add_basic_text_features(df, text_col="col_text")
-    df = add_engagement_ratio_features(df)
-    df = ensure_feature_columns(df)
+    df = add_engagement_features(df)
+
+    # Optional categorical IDs if present
+    for c in ["col_owner_id", "col_from_id"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
 
     # Drop rows with invalid dates (time features become NaN otherwise)
     df = df.dropna(subset=["hour", "dayofweek", "month"]).copy()
@@ -344,6 +408,9 @@ def main() -> int:
         df,
         random_state=args.random_state,
         test_size=args.test_size,
+        sample_weighting=args.sample_weighting,
+        use_author_ids=args.use_author_ids,
+        use_engagement=args.use_engagement,
     )
 
     # Print results
